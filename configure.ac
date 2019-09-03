@@ -27,6 +27,7 @@ AC_INIT(libedit, [EL_RELEASE],, libedit-[EL_TIMESTAMP])
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([src/strlcat.c])
 AC_CONFIG_HEADER([config.h])
+AM_MAINTAINER_MODE
 
 # features of Posix that are extensions to C (define _GNU_SOURCE)
 AC_USE_SYSTEM_EXTENSIONS
