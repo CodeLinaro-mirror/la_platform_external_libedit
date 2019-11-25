@@ -3,7 +3,7 @@
    to manipulate files and their modes.
 
    NOTE: this was taken from the GNU Readline documentation and ported
-   to libedit. A commad to output the history list was added.
+   to libedit. A command to output the history list was added.
    
    */
 
@@ -251,7 +251,7 @@ fileman_completion (const char* text, int start, int end __attribute__((__unused
       directory. */
    if (start == 0)
       /* TODO */
-      matches = completion_matches (text, command_generator);
+      matches = completion_matches ((char*)text, command_generator);
       /* matches = rl_completion_matches (text, command_generator); */
 
    return (matches);
@@ -328,10 +328,10 @@ com_history(char* arg __attribute__((__unused__)))
    HIST_ENTRY *he;
 
    /* rewind history */
-   while (next_history())
+   while (previous_history())
       ;
 
-   for (he = current_history(); he != NULL; he = previous_history()) {
+   for (he = current_history(); he != NULL; he = next_history()) {
       //printf("%5d  %s\n", *((int*)he->data) - 1, he->line);
       printf("%s\n", he->line);
    }

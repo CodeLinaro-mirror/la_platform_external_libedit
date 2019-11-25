@@ -1,4 +1,4 @@
-/*	$NetBSD: filecomplete.c,v 1.31 2011/09/16 16:13:16 plunky Exp $	*/
+/*	$NetBSD: filecomplete.c,v 1.61 2019/10/09 14:31:07 christos Exp $	*/
 
 /*-
  * Copyright (c) 1997 The NetBSD Foundation, Inc.
@@ -32,31 +32,25 @@
 #include "config.h"
 
 #if !defined(lint) && !defined(SCCSID)
-__RCSID("$NetBSD: filecomplete.c,v 1.31 2011/09/16 16:13:16 plunky Exp $");
+__RCSID("$NetBSD: filecomplete.c,v 1.61 2019/10/09 14:31:07 christos Exp $");
 #endif /* not lint && not SCCSID */
 
 #include <sys/types.h>
 #include <sys/stat.h>
-#include <stdio.h>
 #include <dirent.h>
-#include <string.h>
-#include <pwd.h>
-#include <ctype.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <limits.h>
 #include <errno.h>
 #include <fcntl.h>
-#include <vis.h>
+#include <limits.h>
+#include <pwd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
 
 #include "el.h"
-#include "fcns.h"		/* for EL_NUM_FCNS */
-#include "histedit.h"
 #include "filecomplete.h"
 
-static const Char break_chars[] = { ' ', '\t', '\n', '"', '\\', '\'', '`', '@',
-    '$', '>', '<', '=', ';', '|', '&', '{', '(', '\0' };
-
+static const wchar_t break_chars[] = L" \t\n\"\\'`@$><=;|&{(";
 
 /********************************/
 /* completion functions */
@@ -66,7 +60,7 @@ static const Char break_chars[] = { ' ', '\t', '\n', '"', '\\', '\'', '`', '@',
  * if ``user'' isn't valid user name or ``txt'' doesn't start
  * w/ '~', returns pointer to strdup()ed copy of ``txt''
  *
- * it's callers's responsibility to free() returned string
+ * it's the caller's responsibility to free() the returned string
  */
 char *
 fn_tilde_expand(const char *txt)
@@ -90,17 +84,16 @@ fn_tilde_expand(const char *txt)
 	} else {
 		/* text until string after slash */
 		len = (size_t)(temp - txt + 1);
-		temp = el_malloc(len * sizeof(*temp));
+		temp = el_calloc(len, sizeof(*temp));
 		if (temp == NULL)
 			return NULL;
-		(void)strncpy(temp, txt + 1, len - 2);
-		temp[len - 2] = '\0';
+		(void)strlcpy(temp, txt + 1, len - 1);
 	}
 	if (temp[0] == 0) {
 #ifdef HAVE_GETPW_R_POSIX
- 		if (getpwuid_r(getuid(), &pwres, pwbuf, sizeof(pwbuf),
+		if (getpwuid_r(getuid(), &pwres, pwbuf, sizeof(pwbuf),
 		    &pass) != 0)
- 			pass = NULL;
+			pass = NULL;
 #elif HAVE_GETPW_R_DRAFT
 		pass = getpwuid_r(getuid(), &pwres, pwbuf, sizeof(pwbuf));
 #else
@@ -125,7 +118,7 @@ fn_tilde_expand(const char *txt)
 	txt += len;
 
 	len = strlen(pass->pw_dir) + 1 + strlen(txt) + 1;
-	temp = el_malloc(len * sizeof(*temp));
+	temp = el_calloc(len, sizeof(*temp));
 	if (temp == NULL)
 		return NULL;
 	(void)snprintf(temp, len, "%s/%s", pass->pw_dir, txt);
@@ -133,13 +126,199 @@ fn_tilde_expand(const char *txt)
 	return temp;
 }
 
+static int
+needs_escaping(char c)
+{
+	switch (c) {
+	case '\'':
+	case '"':
+	case '(':
+	case ')':
+	case '\\':
+	case '<':
+	case '>':
+	case '$':
+	case '#':
+	case ' ':
+	case '\n':
+	case '\t':
+	case '?':
+	case ';':
+	case '`':
+	case '@':
+	case '=':
+	case '|':
+	case '{':
+	case '}':
+	case '&':
+	case '*':
+	case '[':
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static int
+needs_dquote_escaping(char c)
+{
+	switch (c) {
+	case '"':
+	case '\\':
+	case '`':
+	case '$':
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+
+static wchar_t *
+unescape_string(const wchar_t *string, size_t length)
+{
+	size_t i;
+	size_t j = 0;
+	wchar_t *unescaped = el_calloc(length + 1, sizeof(*string));
+	if (unescaped == NULL)
+		return NULL;
+	for (i = 0; i < length ; i++) {
+		if (string[i] == '\\')
+			continue;
+		unescaped[j++] = string[i];
+	}
+	unescaped[j] = 0;
+	return unescaped;
+}
+
+static char *
+escape_filename(EditLine * el, const char *filename, int single_match,
+		const char *(*app_func)(const char *))
+{
+	size_t original_len = 0;
+	size_t escaped_character_count = 0;
+	size_t offset = 0;
+	size_t newlen;
+	const char *s;
+	char c;
+	size_t s_quoted = 0;	/* does the input contain a single quote */
+	size_t d_quoted = 0;	/* does the input contain a double quote */
+	char *escaped_str;
+	wchar_t *temp = el->el_line.buffer;
+	const char *append_char = NULL;
+
+	if (filename == NULL)
+		return NULL;
+
+	while (temp != el->el_line.cursor) {
+		/*
+		 * If we see a single quote but have not seen a double quote
+		 * so far set/unset s_quote
+		 */
+		if (temp[0] == '\'' && !d_quoted)
+			s_quoted = !s_quoted;
+		/*
+		 * vice versa to the above condition
+		 */
+		else if (temp[0] == '"' && !s_quoted)
+			d_quoted = !d_quoted;
+		temp++;
+	}
+
+	/* Count number of special characters so that we can calculate
+	 * number of extra bytes needed in the new string
+	 */
+	for (s = filename; *s; s++, original_len++) {
+		c = *s;
+		/* Inside a single quote only single quotes need escaping */
+		if (s_quoted && c == '\'') {
+			escaped_character_count += 3;
+			continue;
+		}
+		/* Inside double quotes only ", \, ` and $ need escaping */
+		if (d_quoted && needs_dquote_escaping(c)) {
+			escaped_character_count++;
+			continue;
+		}
+		if (!s_quoted && !d_quoted && needs_escaping(c))
+			escaped_character_count++;
+	}
+
+	newlen = original_len + escaped_character_count + 1;
+	if (s_quoted || d_quoted)
+		newlen++;
+
+	if (single_match && app_func)
+		newlen++;
+
+	if ((escaped_str = el_malloc(newlen)) == NULL)
+		return NULL;
+
+	for (s = filename; *s; s++) {
+		c = *s;
+		if (!needs_escaping(c)) {
+			/* no escaping is required continue as usual */
+			escaped_str[offset++] = c;
+			continue;
+		}
+
+		/* single quotes inside single quotes require special handling */
+		if (c == '\'' && s_quoted) {
+			escaped_str[offset++] = '\'';
+			escaped_str[offset++] = '\\';
+			escaped_str[offset++] = '\'';
+			escaped_str[offset++] = '\'';
+			continue;
+		}
+
+		/* Otherwise no escaping needed inside single quotes */
+		if (s_quoted) {
+			escaped_str[offset++] = c;
+			continue;
+		}
+
+		/* No escaping needed inside a double quoted string either
+		 * unless we see a '$', '\', '`', or '"' (itself)
+		 */
+		if (d_quoted && !needs_dquote_escaping(c)) {
+			escaped_str[offset++] = c;
+			continue;
+		}
+
+		/* If we reach here that means escaping is actually needed */
+		escaped_str[offset++] = '\\';
+		escaped_str[offset++] = c;
+	}
+
+	if (single_match && app_func) {
+		escaped_str[offset] = 0;
+		append_char = app_func(escaped_str);
+		/* we want to append space only if we are not inside quotes */
+		if (append_char[0] == ' ') {
+			if (!s_quoted && !d_quoted)
+				escaped_str[offset++] = append_char[0];
+		} else
+			escaped_str[offset++] = append_char[0];
+	}
+
+	/* close the quotes if single match and the match is not a directory */
+	if (single_match && (append_char && append_char[0] == ' ')) { 
+		if (s_quoted)
+			escaped_str[offset++] = '\'';
+		else if (d_quoted)
+			escaped_str[offset++] = '"';
+	}
+
+	escaped_str[offset] = 0;
+	return escaped_str;
+}
 
 /*
  * return first found file name starting by the ``text'' or NULL if no
  * such file can be found
  * value of ``state'' is ignored
  *
- * it's caller's responsibility to free returned string
+ * it's the caller's responsibility to free the returned string
  */
 char *
 fn_filename_completion_function(const char *text, int state)
@@ -175,8 +354,7 @@ fn_filename_completion_function(const char *text, int state)
 				return NULL;
 			}
 			dirname = nptr;
-			(void)strncpy(dirname, text, len);
-			dirname[len] = '\0';
+			(void)strlcpy(dirname, text, len + 1);
 		} else {
 			el_free(filename);
 			if (*text == 0)
@@ -243,7 +421,7 @@ fn_filename_completion_function(const char *text, int state)
 		len = strlen(entry->d_name);
 
 		len = strlen(dirname) + len + 1;
-		temp = el_malloc(len * sizeof(*temp));
+		temp = el_calloc(len, sizeof(*temp));
 		if (temp == NULL)
 			return NULL;
 		(void)snprintf(temp, len, "%s%s", dirname, entry->d_name);
@@ -319,13 +497,12 @@ completion_matches(const char *text, char *(*genfunc)(const char *, int))
 		max_equal = i;
 	}
 
-	retstr = el_malloc((max_equal + 1) * sizeof(*retstr));
+	retstr = el_calloc(max_equal + 1, sizeof(*retstr));
 	if (retstr == NULL) {
 		el_free(match_list);
 		return NULL;
 	}
-	(void)strncpy(retstr, match_list[1], max_equal);
-	retstr[max_equal] = '\0';
+	(void)strlcpy(retstr, match_list[1], max_equal + 1);
 	match_list[0] = retstr;
 
 	/* add NULL as last pointer to the array */
@@ -355,10 +532,13 @@ _fn_qsort_string_compare(const void *i1, const void *i2)
  * num, so the strings are matches[1] *through* matches[num-1].
  */
 void
-fn_display_match_list (EditLine *el, char **matches, size_t num, size_t width)
+fn_display_match_list(EditLine * el, char **matches, size_t num, size_t width,
+    const char *(*app_func) (const char *))
 {
 	size_t line, lines, col, cols, thisguy;
 	int screenwidth = el->el_terminal.t_size.h;
+	if (app_func == NULL)
+		app_func = append_char_function;
 
 	/* Ignore matches[0]. Avoid 1-based array logic below. */
 	matches++;
@@ -368,7 +548,7 @@ fn_display_match_list (EditLine *el, char **matches, size_t num, size_t width)
 	 * Find out how many entries can be put on one line; count
 	 * with one space between strings the same way it's printed.
 	 */
-	cols = (size_t)screenwidth / (width + 1);
+	cols = (size_t)screenwidth / (width + 2);
 	if (cols == 0)
 		cols = 1;
 
@@ -386,11 +566,68 @@ fn_display_match_list (EditLine *el, char **matches, size_t num, size_t width)
 			thisguy = line + col * lines;
 			if (thisguy >= num)
 				break;
-			(void)fprintf(el->el_outfile, "%s%-*s",
-			    col == 0 ? "" : " ", (int)width, matches[thisguy]);
+			(void)fprintf(el->el_outfile, "%s%s%s",
+			    col == 0 ? "" : " ", matches[thisguy],
+				(*app_func)(matches[thisguy]));
+			(void)fprintf(el->el_outfile, "%-*s",
+				(int) (width - strlen(matches[thisguy])), "");
 		}
 		(void)fprintf(el->el_outfile, "\n");
 	}
+}
+
+static wchar_t *
+find_word_to_complete(const wchar_t * cursor, const wchar_t * buffer,
+    const wchar_t * word_break, const wchar_t * special_prefixes, size_t * length)
+{
+	/* We now look backwards for the start of a filename/variable word */
+	const wchar_t *ctemp = cursor;
+	size_t len;
+
+	/* if the cursor is placed at a slash or a quote, we need to find the
+	 * word before it
+	 */
+	if (ctemp > buffer) {
+		switch (ctemp[-1]) {
+		case '\\':
+		case '\'':
+		case '"':
+			ctemp--;
+			break;
+		default:
+			break;
+		}
+	}
+
+	for (;;) {
+		if (ctemp <= buffer)
+			break;
+		if (wcschr(word_break, ctemp[-1])) {
+			if (ctemp - buffer >= 2 && ctemp[-2] == '\\') {
+				ctemp -= 2;
+				continue;
+			} else if (ctemp - buffer >= 2 &&
+			    (ctemp[-2] == '\'' || ctemp[-2] == '"')) {
+				ctemp--;
+				continue;
+			} else
+				break;
+		}
+		if (special_prefixes && wcschr(special_prefixes, ctemp[-1]))
+			break;
+		ctemp--;
+	}
+
+	len = (size_t) (cursor - ctemp);
+	if (len == 1 && (ctemp[0] == '\'' || ctemp[0] == '"')) {
+		len = 0;
+		ctemp++;
+	}
+	*length = len;
+	wchar_t *unescaped_word = unescape_string(ctemp, len);
+	if (unescaped_word == NULL)
+		return NULL;
+	return unescaped_word;
 }
 
 /*
@@ -409,14 +646,14 @@ int
 fn_complete(EditLine *el,
 	char *(*complet_func)(const char *, int),
 	char **(*attempted_completion_function)(const char *, int, int),
-	const Char *word_break, const Char *special_prefixes,
+	const wchar_t *word_break, const wchar_t *special_prefixes,
 	const char *(*app_func)(const char *), size_t query_items,
 	int *completion_type, int *over, int *point, int *end)
 {
-	const TYPE(LineInfo) *li;
-	Char *temp;
-        char **matches;
-	const Char *ctemp;
+	const LineInfoW *li;
+	wchar_t *temp;
+	char **matches;
+	char *completion;
 	size_t len;
 	int what_to_do = '\t';
 	int retval = CC_NORM;
@@ -433,22 +670,15 @@ fn_complete(EditLine *el,
 	if (!app_func)
 		app_func = append_char_function;
 
-	/* We now look backwards for the start of a filename/variable word */
-	li = FUN(el,line)(el);
-	ctemp = li->cursor;
-	while (ctemp > li->buffer
-	    && !Strchr(word_break, ctemp[-1])
-	    && (!special_prefixes || !Strchr(special_prefixes, ctemp[-1]) ) )
-		ctemp--;
-
-	len = (size_t)(li->cursor - ctemp);
-	temp = el_malloc((len + 1) * sizeof(*temp));
-	(void)Strncpy(temp, ctemp, len);
-	temp[len] = '\0';
+	li = el_wline(el);
+	temp = find_word_to_complete(li->cursor,
+	    li->buffer, word_break, special_prefixes, &len);
+	if (temp == NULL)
+		goto out;
 
 	/* these can be used by function called in completion_matches() */
 	/* or (*attempted_completion_function)() */
-	if (point != 0)
+	if (point != NULL)
 		*point = (int)(li->cursor - li->buffer);
 	if (end != NULL)
 		*end = (int)(li->lastchar - li->buffer);
@@ -459,8 +689,8 @@ fn_complete(EditLine *el,
 		    ct_encode_string(temp, &el->el_scratch),
 		    cur_off - (int)len, cur_off);
 	} else
-		matches = 0;
-	if (!attempted_completion_function || 
+		matches = NULL;
+	if (!attempted_completion_function ||
 	    (over != NULL && !*over && !matches))
 		matches = completion_matches(
 		    ct_encode_string(temp, &el->el_scratch), complet_func);
@@ -471,32 +701,41 @@ fn_complete(EditLine *el,
 	if (matches) {
 		int i;
 		size_t matches_num, maxlen, match_len, match_display=1;
+		int single_match = matches[2] == NULL &&
+			(matches[1] == NULL || strcmp(matches[0], matches[1]) == 0);
 
 		retval = CC_REFRESH;
-		/*
-		 * Only replace the completed string with common part of
-		 * possible matches if there is possible completion.
-		 */
+
 		if (matches[0][0] != '\0') {
-			el_deletestr(el, (int) len);
-			FUN(el,insertstr)(el,
-			    ct_decode_string(matches[0], &el->el_scratch));
+			el_deletestr(el, (int)len);
+			if (!attempted_completion_function)
+				completion = escape_filename(el, matches[0],
+				    single_match, app_func);
+			else
+				completion = strdup(matches[0]);
+			if (completion == NULL)
+				goto out;
+			if (single_match) {
+				/* We found exact match. Add a space after it,
+				 * unless we do filename completion and the
+				 * object is a directory. Also do necessary
+				 * escape quoting
+				 */
+				el_winsertstr(el,
+				    ct_decode_string(completion, &el->el_scratch));
+			} else {
+				/* Only replace the completed string with
+				 * common part of possible matches if there is
+				 * possible completion.
+				 */
+				el_winsertstr(el,
+				    ct_decode_string(completion, &el->el_scratch));
+			}
+			free(completion);
 		}
 
-		if (what_to_do == '?')
-			goto display_matches;
 
-		if (matches[2] == NULL && strcmp(matches[0], matches[1]) == 0) {
-			/*
-			 * We found exact match. Add a space after
-			 * it, unless we do filename completion and the
-			 * object is a directory.
-			 */
-			FUN(el,insertstr)(el,
-			    ct_decode_string((*app_func)(matches[0]),
-			    &el->el_scratch));
-		} else if (what_to_do == '!') {
-    display_matches:
+		if (!single_match && (what_to_do == '!' || what_to_do == '?')) {
 			/*
 			 * More than one match and requested to list possible
 			 * matches.
@@ -509,7 +748,7 @@ fn_complete(EditLine *el,
 			}
 			/* matches[1] through matches[i-1] are available */
 			matches_num = (size_t)(i - 1);
-				
+
 			/* newline to get on next line from command line */
 			(void)fprintf(el->el_outfile, "\n");
 
@@ -536,7 +775,7 @@ fn_complete(EditLine *el,
 				 * add 1 to matches_num for the call.
 				 */
 				fn_display_match_list(el, matches,
-				    matches_num+1, maxlen);
+				    matches_num+1, maxlen, app_func);
 			}
 			retval = CC_REDISPLAY;
 		} else if (matches[0][0]) {
@@ -559,6 +798,8 @@ fn_complete(EditLine *el,
 		el_free(matches);
 		matches = NULL;
 	}
+
+out:
 	el_free(temp);
 	return retval;
 }
