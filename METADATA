@@ -7,12 +7,12 @@ third_party {
   }
   url {
     type: ARCHIVE
-    value: "https://www.thrysoee.dk/editline/libedit-20190324-3.1.tar.gz"
+    value: "https://www.thrysoee.dk/editline/libedit-20191025-3.1.tar.gz"
   }
-  version: "20190324-3.1"
+  version: "20191025-3.1"
   last_upgrade_date {
     year: 2019
-    month: 8
-    day: 28
+    month: 11
+    day: 25
   }
 }
